@@ -83,11 +83,13 @@ class ServerManager: ObservableObject {
     private let maxLogLines = 1000
     private let processQueue = DispatchQueue(label: "io.automaze.vibeproxy.server-process", qos: .userInitiated)
     private let credentialMutationQueue = DispatchQueue(label: "io.automaze.vibeproxy.credential-mutations", qos: .userInitiated)
+    private let configInputStateQueue = DispatchQueue(label: "io.automaze.vibeproxy.config-input-state", qos: .userInitiated)
     private lazy var zaiAPIKeyStore = ZAIAPIKeyStore(directoryURL: authDirectoryURL())
     private lazy var customProviderCredentialStore = CustomProviderCredentialStore(directoryURL: authDirectoryURL())
     private var activeConfigPath = ""
     private var isRestartingForConfigUpdate = false
     private var hasPendingConfigUpdate = false
+    private var observedConfigInputsFingerprint = ""
     
     private enum Timing {
         static let readinessCheckDelay: TimeInterval = 1.0
@@ -119,6 +121,7 @@ class ServerManager: ObservableObject {
         vercelGatewayEnabled = UserDefaults.standard.bool(forKey: "vercelGatewayEnabled")
         vercelApiKey = UserDefaults.standard.string(forKey: "vercelApiKey") ?? ""
         reloadCustomProviders()
+        markObservedConfigInputsCurrent()
     }
 
     /// Check if a provider is enabled (defaults to true if not set)
@@ -552,6 +555,15 @@ class ServerManager: ObservableObject {
     }
 
     func refreshAuthBackedConfiguration() {
+        markObservedConfigInputsCurrent()
+        reloadCustomProviders()
+        requestConfigUpdate()
+    }
+
+    func handleObservedConfigInputsChanged() {
+        guard markObservedConfigInputsChanged() else {
+            return
+        }
         reloadCustomProviders()
         requestConfigUpdate()
     }
@@ -826,6 +838,31 @@ class ServerManager: ObservableObject {
             )
         }
         return .success(LoadedBaseConfig(root: root, isUserConfig: isUserConfig))
+    }
+
+    private func currentObservedConfigInputsFingerprint() -> String {
+        ConfigInputFingerprint.compute(
+            in: authDirectoryURL(),
+            userConfigFilename: CustomProviderConstants.userConfigFilename
+        )
+    }
+
+    private func markObservedConfigInputsCurrent() {
+        let fingerprint = currentObservedConfigInputsFingerprint()
+        configInputStateQueue.sync {
+            observedConfigInputsFingerprint = fingerprint
+        }
+    }
+
+    private func markObservedConfigInputsChanged() -> Bool {
+        let fingerprint = currentObservedConfigInputsFingerprint()
+        return configInputStateQueue.sync {
+            guard fingerprint != observedConfigInputsFingerprint else {
+                return false
+            }
+            observedConfigInputsFingerprint = fingerprint
+            return true
+        }
     }
     
     private func loadZaiAPIKeys() -> [String] {

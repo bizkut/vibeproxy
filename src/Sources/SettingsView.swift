@@ -1094,7 +1094,7 @@ struct SettingsView: View {
             let workItem = DispatchWorkItem {
                 NSLog("[FileMonitor] Auth directory changed - refreshing status")
                 authManager.checkAuthStatus()
-                serverManager.reloadCustomProviders()
+                serverManager.handleObservedConfigInputsChanged()
             }
             pendingRefresh = workItem
             DispatchQueue.main.asyncAfter(deadline: .now() + Timing.refreshDebounce, execute: workItem)

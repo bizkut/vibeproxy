@@ -296,6 +296,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUserNoti
 
     @objc func handleAuthDirectoryChanged() {
         NSLog("[AppDelegate] Auth directory changed notification received — refreshing settings")
+        serverManager.handleObservedConfigInputsChanged()
         // Re-open settings window if it exists so the user sees the new account
         if let window = settingsWindow {
             window.makeKeyAndOrderFront(nil)
