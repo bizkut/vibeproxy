@@ -257,11 +257,206 @@ struct ServiceRow<ExtraContent: View>: View {
     }
 }
 
+struct CustomProviderCredentialRowView: View {
+    let credential: CustomProviderCredential
+    let removeColor: Color
+    let onToggleDisabled: () -> Void
+    let onRemove: () -> Void
+    
+    var body: some View {
+        HStack(spacing: 8) {
+            Circle()
+                .fill(credential.isDisabled ? Color.gray : Color.green)
+                .frame(width: 6, height: 6)
+            Text(credential.label)
+                .font(.caption)
+                .foregroundColor(credential.isDisabled ? .secondary.opacity(0.5) : .secondary)
+                .strikethrough(credential.isDisabled)
+            if credential.isDisabled {
+                Text("(disabled)")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+            }
+            Button(action: onToggleDisabled) {
+                Text(credential.isDisabled ? "Enable" : "Disable")
+                    .font(.caption)
+                    .foregroundColor(credential.isDisabled ? .green : .orange)
+            }
+            .buttonStyle(.plain)
+            .onHover { inside in
+                if inside { NSCursor.pointingHand.push() } else { NSCursor.pop() }
+            }
+            Button(action: onRemove) {
+                HStack(spacing: 2) {
+                    Image(systemName: "minus.circle.fill")
+                        .font(.caption)
+                    Text("Remove")
+                        .font(.caption)
+                }
+                .foregroundColor(removeColor)
+            }
+            .buttonStyle(.plain)
+            .onHover { inside in
+                if inside { NSCursor.pointingHand.push() } else { NSCursor.pop() }
+            }
+        }
+        .padding(.leading, 28)
+    }
+}
+
+struct CustomProviderRow: View {
+    let provider: CustomProviderDefinition
+    let credentials: [CustomProviderCredential]
+    let isAuthenticating: Bool
+    let isEnabled: Bool
+    let onConnect: () -> Void
+    let onDisconnect: (CustomProviderCredential) -> Void
+    let onToggleDisabled: (CustomProviderCredential) -> Void
+    let onToggleEnabled: (Bool) -> Void
+    var onExpandChange: ((Bool) -> Void)? = nil
+    
+    @State private var isExpanded = false
+    @State private var credentialToRemove: CustomProviderCredential?
+    @State private var showingRemoveConfirmation = false
+    
+    private var enabledCredentialCount: Int { credentials.filter { !$0.isDisabled }.count }
+    private var totalConfiguredKeyCount: Int { credentials.count + provider.inlineKeyCount }
+    private var totalEnabledKeyCount: Int { enabledCredentialCount + provider.inlineKeyCount }
+    private let removeColor = Color(red: 0xeb/255, green: 0x0f/255, blue: 0x0f/255)
+    
+    private var summaryText: String {
+        var parts: [String] = []
+        if !credentials.isEmpty {
+            parts.append("\(credentials.count) UI key\(credentials.count == 1 ? "" : "s")")
+        }
+        if provider.inlineKeyCount > 0 {
+            parts.append("\(provider.inlineKeyCount) inline key\(provider.inlineKeyCount == 1 ? "" : "s")")
+        }
+        if parts.isEmpty {
+            return "No configured API keys"
+        }
+        return parts.joined(separator: " • ")
+    }
+    
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Toggle("", isOn: Binding(
+                    get: { isEnabled },
+                    set: { onToggleEnabled($0) }
+                ))
+                .toggleStyle(.switch)
+                .controlSize(.mini)
+                .labelsHidden()
+                .help(isEnabled ? "Disable this provider" : "Enable this provider")
+                
+                Image(systemName: provider.effectiveIconSystemName)
+                    .frame(width: 20, height: 20)
+                    .foregroundColor(isEnabled ? .primary : .secondary)
+                    .opacity(isEnabled ? 1.0 : 0.4)
+                
+                Text(provider.title)
+                    .fontWeight(.medium)
+                    .foregroundColor(isEnabled ? .primary : .secondary)
+                
+                Spacer()
+                
+                if isAuthenticating {
+                    ProgressView()
+                        .controlSize(.small)
+                } else if isEnabled {
+                    Button("Add API Key") {
+                        onConnect()
+                    }
+                    .controlSize(.small)
+                }
+            }
+            
+            if isEnabled {
+                if totalConfiguredKeyCount > 0 {
+                    HStack(spacing: 4) {
+                        Text(summaryText)
+                            .font(.caption)
+                            .foregroundColor(.green)
+                        
+                        if totalEnabledKeyCount > 1 {
+                            Text("• Round-robin w/ auto-failover")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                        
+                        Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                    .padding(.leading, 28)
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        withAnimation(.easeInOut(duration: 0.2)) {
+                            isExpanded.toggle()
+                        }
+                    }
+                    
+                    if isExpanded {
+                        VStack(alignment: .leading, spacing: 6) {
+                            if provider.inlineKeyCount > 0 {
+                                Text("Using \(provider.inlineKeyCount) inline API key\(provider.inlineKeyCount == 1 ? "" : "s") from config")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                                    .padding(.leading, 28)
+                            }
+                            
+                            ForEach(credentials) { credential in
+                                CustomProviderCredentialRowView(
+                                    credential: credential,
+                                    removeColor: removeColor,
+                                    onToggleDisabled: { onToggleDisabled(credential) },
+                                    onRemove: {
+                                        credentialToRemove = credential
+                                        showingRemoveConfirmation = true
+                                    }
+                                )
+                            }
+                        }
+                        .padding(.top, 4)
+                    }
+                } else {
+                    Text("No configured API keys")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .padding(.leading, 28)
+                }
+            }
+        }
+        .padding(.vertical, 4)
+        .help(provider.effectiveHelpText)
+        .onChange(of: isExpanded) { newValue in
+            onExpandChange?(newValue)
+        }
+        .alert("Remove API Key", isPresented: $showingRemoveConfirmation) {
+            Button("Cancel", role: .cancel) {
+                credentialToRemove = nil
+            }
+            Button("Remove", role: .destructive) {
+                if let credential = credentialToRemove {
+                    onDisconnect(credential)
+                }
+                credentialToRemove = nil
+            }
+        } message: {
+            if let credential = credentialToRemove {
+                Text("Are you sure you want to remove \(credential.label) from \(provider.title)?")
+            }
+        }
+    }
+}
+
 struct SettingsView: View {
     @ObservedObject var serverManager: ServerManager
     @StateObject private var authManager = AuthManager()
     @State private var launchAtLogin = false
     @State private var authenticatingService: ServiceType? = nil
+    @State private var authenticatingCustomProviderID: String? = nil
     @State private var showingAuthResult = false
     @State private var authResultMessage = ""
     @State private var authResultSuccess = false
@@ -270,6 +465,8 @@ struct SettingsView: View {
     @State private var qwenEmail = ""
     @State private var showingZaiApiKeyPrompt = false
     @State private var zaiApiKey = ""
+    @State private var selectedCustomProvider: CustomProviderDefinition?
+    @State private var customProviderApiKey = ""
     @State private var pendingRefresh: DispatchWorkItem?
     @State private var expandedRowCount = 0
     
@@ -433,6 +630,35 @@ struct SettingsView: View {
                         onExpandChange: { expanded in expandedRowCount += expanded ? 1 : -1 }
                     ) { EmptyView() }
                 }
+                
+                if !serverManager.customProviders.isEmpty {
+                    Section("Custom Providers") {
+                        ForEach(serverManager.customProviders) { provider in
+                            CustomProviderRow(
+                                provider: provider,
+                                credentials: serverManager.customProviderCredentials[provider.id] ?? [],
+                                isAuthenticating: authenticatingCustomProviderID == provider.id,
+                                isEnabled: serverManager.isProviderEnabled(provider.id),
+                                onConnect: {
+                                    customProviderApiKey = ""
+                                    selectedCustomProvider = provider
+                                },
+                                onDisconnect: { credential in
+                                    disconnectCustomProviderCredential(provider: provider, credential: credential)
+                                },
+                                onToggleDisabled: { credential in
+                                    toggleCustomProviderCredential(provider: provider, credential: credential)
+                                },
+                                onToggleEnabled: { enabled in
+                                    serverManager.setProviderEnabled(provider.id, enabled: enabled)
+                                },
+                                onExpandChange: { expanded in
+                                    expandedRowCount += expanded ? 1 : -1
+                                }
+                            )
+                        }
+                    }
+                }
             }
             .formStyle(.grouped)
             .scrollDisabled(expandedRowCount == 0)
@@ -539,8 +765,38 @@ struct SettingsView: View {
             .padding(24)
             .frame(width: 400)
         }
+        .sheet(item: $selectedCustomProvider, onDismiss: {
+            customProviderApiKey = ""
+        }) { provider in
+            VStack(spacing: 16) {
+                Text("\(provider.title) API Key")
+                    .font(.headline)
+                Text("Enter an API key for \(provider.title)")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                SecureField("", text: $customProviderApiKey)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(width: 320)
+                HStack(spacing: 12) {
+                    Button("Cancel") {
+                        selectedCustomProvider = nil
+                        customProviderApiKey = ""
+                    }
+                    Button("Add Key") {
+                        let currentProvider = provider
+                        selectedCustomProvider = nil
+                        startCustomProviderAuth(provider: currentProvider, apiKey: customProviderApiKey)
+                    }
+                    .disabled(customProviderApiKey.isEmpty)
+                    .keyboardShortcut(.defaultAction)
+                }
+            }
+            .padding(24)
+            .frame(width: 420)
+        }
         .onAppear {
             authManager.checkAuthStatus()
+            serverManager.reloadCustomProviders()
             checkLaunchAtLogin()
             startMonitoringAuthDirectory()
         }
@@ -703,6 +959,54 @@ struct SettingsView: View {
         }
     }
     
+    private func startCustomProviderAuth(provider: CustomProviderDefinition, apiKey: String) {
+        authenticatingCustomProviderID = provider.id
+        NSLog("[SettingsView] Adding API key for custom provider %@", provider.id)
+        
+        serverManager.saveCustomProviderAPIKey(providerID: provider.id, apiKey: apiKey) { success, output in
+            NSLog("[SettingsView] Custom provider key save completed - success: %d, output: %@", success, output)
+            DispatchQueue.main.async {
+                self.authenticatingCustomProviderID = nil
+                self.customProviderApiKey = ""
+                
+                if success {
+                    self.authResultSuccess = true
+                    self.authResultMessage = "✓ \(provider.title) API key added successfully.\n\nYou can now use this provider through the proxy."
+                    self.showingAuthResult = true
+                    self.serverManager.reloadCustomProviders()
+                } else {
+                    self.authResultSuccess = false
+                    self.authResultMessage = "Failed to save API key for \(provider.title).\n\nDetails: \(output.isEmpty ? "Unknown error" : output)"
+                    self.showingAuthResult = true
+                }
+            }
+        }
+    }
+    
+    private func toggleCustomProviderCredential(provider: CustomProviderDefinition, credential: CustomProviderCredential) {
+        if serverManager.toggleCustomProviderCredentialDisabled(credential) {
+            authResultSuccess = true
+            authResultMessage = credential.isDisabled
+                ? "✓ Enabled \(credential.label) for \(provider.title)"
+                : "✓ Disabled \(credential.label) for \(provider.title)"
+        } else {
+            authResultSuccess = false
+            authResultMessage = "Failed to update \(credential.label) for \(provider.title). Please try again."
+        }
+        showingAuthResult = true
+    }
+    
+    private func disconnectCustomProviderCredential(provider: CustomProviderDefinition, credential: CustomProviderCredential) {
+        if serverManager.deleteCustomProviderCredential(credential) {
+            authResultSuccess = true
+            authResultMessage = "✓ Removed \(credential.label) from \(provider.title)"
+        } else {
+            authResultSuccess = false
+            authResultMessage = "Failed to remove \(credential.label) from \(provider.title)"
+        }
+        showingAuthResult = true
+    }
+    
     private func disconnectAccount(_ account: AuthAccount) {
         let wasRunning = serverManager.isRunning
         
@@ -752,6 +1056,7 @@ struct SettingsView: View {
             let workItem = DispatchWorkItem {
                 NSLog("[FileMonitor] Auth directory changed - refreshing status")
                 authManager.checkAuthStatus()
+                serverManager.reloadCustomProviders()
             }
             pendingRefresh = workItem
             DispatchQueue.main.asyncAfter(deadline: .now() + Timing.refreshDebounce, execute: workItem)
