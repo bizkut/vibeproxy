@@ -1,6 +1,7 @@
 import Foundation
 import Combine
 import AppKit
+import Yams
 
 private struct RingBuffer<Element> {
     private var storage: [Element?]
@@ -48,6 +49,8 @@ class ServerManager: ObservableObject {
     private var process: Process?
     @Published private(set) var isRunning = false
     private(set) var port = 8317
+    @Published private(set) var customProviders: [CustomProviderDefinition] = []
+    @Published private(set) var customProviderCredentials: [String: [CustomProviderCredential]] = [:]
 
     /// Provider enabled states - when disabled, models are excluded via oauth-excluded-models
     @Published var enabledProviders: [String: Bool] = [:] {
@@ -78,11 +81,28 @@ class ServerManager: ObservableObject {
     private var logBuffer: RingBuffer<String>
     private let maxLogLines = 1000
     private let processQueue = DispatchQueue(label: "io.automaze.vibeproxy.server-process", qos: .userInitiated)
+    private var activeConfigPath = ""
     
     private enum Timing {
         static let readinessCheckDelay: TimeInterval = 1.0
         static let gracefulTerminationTimeout: TimeInterval = 2.0
         static let terminationPollInterval: TimeInterval = 0.05
+    }
+    
+    private enum CustomProviderConstants {
+        static let authType = "openai-compat"
+        static let userConfigFilename = "config.yaml"
+        static let mergedConfigFilename = "merged-config.yaml"
+        static let managedZAIProviderName = "zai"
+        static let uiMetadataKeys: Set<String> = ["display-name", "help-text", "icon-system"]
+    }
+    
+    private struct CustomProviderAuthRecord {
+        let providerID: String
+        let apiKey: String
+        let label: String
+        let filePath: URL
+        let isDisabled: Bool
     }
     
     var onLogUpdate: (([String]) -> Void)?
@@ -96,6 +116,7 @@ class ServerManager: ObservableObject {
         "antigravity": "antigravity",
         "qwen": "qwen"
     ]
+    static let reservedCustomProviderKeys = Set(oauthProviderKeys.keys).union([CustomProviderConstants.managedZAIProviderName])
 
     init() {
         logBuffer = RingBuffer(capacity: maxLogLines)
@@ -104,6 +125,7 @@ class ServerManager: ObservableObject {
         }
         vercelGatewayEnabled = UserDefaults.standard.bool(forKey: "vercelGatewayEnabled")
         vercelApiKey = UserDefaults.standard.string(forKey: "vercelApiKey") ?? ""
+        reloadCustomProviders()
     }
 
     /// Check if a provider is enabled (defaults to true if not set)
@@ -115,10 +137,8 @@ class ServerManager: ObservableObject {
     func setProviderEnabled(_ providerKey: String, enabled: Bool) {
         enabledProviders[providerKey] = enabled
         addLog(enabled ? "✓ Enabled provider: \(providerKey)" : "⚠️ Disabled provider: \(providerKey)")
-
-        // Regenerate config - CLIProxyAPI hot reloads config.yaml automatically
-        _ = getConfigPath()
-        addLog("Config updated (hot reload)")
+        reloadCustomProviders()
+        applyConfigUpdate()
     }
     
     deinit {
@@ -191,6 +211,7 @@ class ServerManager: ObservableObject {
             
             DispatchQueue.main.async {
                 self?.isRunning = false
+                self?.activeConfigPath = ""
                 self?.addLog("Server stopped with code: \(process.terminationStatus)")
                 NotificationCenter.default.post(name: .serverStatusChanged, object: nil)
             }
@@ -200,6 +221,7 @@ class ServerManager: ObservableObject {
             try process?.run()
             DispatchQueue.main.async {
                 self.isRunning = true
+                self.activeConfigPath = configPath
             }
             addLog("✓ Server started on port \(port)")
             
@@ -255,6 +277,7 @@ class ServerManager: ObservableObject {
             DispatchQueue.main.async {
                 self.process = nil
                 self.isRunning = false
+                self.activeConfigPath = ""
                 self.addLog("✓ Server stopped")
                 NotificationCenter.default.post(name: .serverStatusChanged, object: nil)
                 completion?()
@@ -278,8 +301,8 @@ class ServerManager: ObservableObject {
         let authProcess = Process()
         authProcess.executableURL = URL(fileURLWithPath: bundledPath)
         
-        // Get the config path
-        let configPath = (resourcePath as NSString).appendingPathComponent("config.yaml")
+        // Use the same base config path selection as the server runtime.
+        let configPath = preferredBaseConfigPath() ?? (resourcePath as NSString).appendingPathComponent("config.yaml")
         
         var qwenEmail: String?
         
@@ -470,9 +493,8 @@ class ServerManager: ObservableObject {
     
     /// Saves a Z.AI API key to the auth directory
     func saveZaiApiKey(_ apiKey: String, completion: @escaping (Bool, String) -> Void) {
-        let authDir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".cli-proxy-api")
+        let authDir = authDirectoryURL()
         
-        // Create auth directory if needed
         do {
             try FileManager.default.createDirectory(at: authDir, withIntermediateDirectories: true)
         } catch {
@@ -480,13 +502,10 @@ class ServerManager: ObservableObject {
             return
         }
         
-        // Generate unique filename with masked key for display
-        let keyPreview = String(apiKey.prefix(8)) + "..." + String(apiKey.suffix(4))
+        let keyPreview = maskAPIKey(apiKey)
         let timestamp = ISO8601DateFormatter().string(from: Date())
         let filename = "zai-\(UUID().uuidString.prefix(8)).json"
         let filePath = authDir.appendingPathComponent(filename)
-        
-        // Create auth JSON matching the format used by other providers
         let authData: [String: Any] = [
             "type": "zai",
             "email": keyPreview,
@@ -497,126 +516,204 @@ class ServerManager: ObservableObject {
         do {
             let jsonData = try JSONSerialization.data(withJSONObject: authData, options: .prettyPrinted)
             try jsonData.write(to: filePath)
-            // Set secure permissions (0600 - owner read/write only)
             try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: filePath.path)
             addLog("✓ Z.AI API key saved to \(filename)")
-            
-            // Restart server to pick up new config (getConfigPath will merge Z.AI keys)
-            let wasRunning = isRunning
-            if wasRunning {
-                stop { [weak self] in
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                        self?.start { _ in }
-                    }
-                }
-            }
-            
+            reloadCustomProviders()
+            applyConfigUpdate()
             completion(true, "API key saved successfully")
         } catch {
             completion(false, "Failed to save API key: \(error.localizedDescription)")
         }
     }
     
-    /// Returns the config path to use, merging bundled config with Z.AI provider and provider exclusions
-    func getConfigPath() -> String {
-        guard let resourcePath = Bundle.main.resourcePath else {
-            return ""
-        }
-
-        let bundledConfigPath = (resourcePath as NSString).appendingPathComponent("config.yaml")
-        let authDir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".cli-proxy-api")
-
-        // Check for Z.AI auth files
-        var zaiApiKeys: [String] = []
-        if let files = try? FileManager.default.contentsOfDirectory(at: authDir, includingPropertiesForKeys: nil) {
-            for file in files where file.lastPathComponent.hasPrefix("zai-") && file.pathExtension == "json" {
-                if let data = try? Data(contentsOf: file),
-                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                   let apiKey = json["api_key"] as? String {
-                    zaiApiKeys.append(apiKey)
-                }
-            }
-        }
-
-        // Build list of disabled providers
-        var disabledProviders: [String] = []
-        for (serviceKey, oauthKey) in Self.oauthProviderKeys {
-            if !isProviderEnabled(serviceKey) {
-                disabledProviders.append(oauthKey)
-            }
-        }
-
-        // If no Z.AI keys and no disabled providers, use bundled config
-        guard !zaiApiKeys.isEmpty || !disabledProviders.isEmpty else {
-            return bundledConfigPath
-        }
-
-        // Generate merged config
-        guard let bundledContent = try? String(contentsOfFile: bundledConfigPath, encoding: .utf8) else {
-            return bundledConfigPath
-        }
-        
-        var additionalConfig = ""
-
-        // Build oauth-excluded-models section for disabled providers
-        if !disabledProviders.isEmpty {
-            additionalConfig += """
-
-# Provider exclusions (auto-added by VibeProxy)
-# Disabled providers have all models excluded
-oauth-excluded-models:
-
-"""
-            for provider in disabledProviders.sorted() {
-                additionalConfig += "  \(provider):\n"
-                additionalConfig += "    - \"*\"\n"
-            }
-        }
-
-        // Build Z.AI openai-compatibility section (only if Z.AI is enabled)
-        if !zaiApiKeys.isEmpty && isProviderEnabled("zai") {
-            additionalConfig += """
-
-# Z.AI GLM Provider (auto-added by VibeProxy)
-openai-compatibility:
-  - name: "zai"
-    base-url: "https://api.z.ai/api/coding/paas/v4"
-    api-key-entries:
-
-"""
-            for key in zaiApiKeys {
-                // Escape special YAML characters in double-quoted strings
-                let escapedKey = key
-                    .replacingOccurrences(of: "\\", with: "\\\\")
-                    .replacingOccurrences(of: "\"", with: "\\\"")
-                    .replacingOccurrences(of: "\n", with: "\\n")
-                    .replacingOccurrences(of: "\t", with: "\\t")
-                additionalConfig += "      - api-key: \"\(escapedKey)\"\n"
-            }
-            additionalConfig += """
-    models:
-      - name: "glm-4.7"
-        alias: "glm-4.7"
-      - name: "glm-4-plus"
-        alias: "glm-4-plus"
-      - name: "glm-4-air"
-        alias: "glm-4-air"
-      - name: "glm-4-flash"
-        alias: "glm-4-flash"
-"""
-        }
-
-        let mergedContent = bundledContent + additionalConfig
-        let mergedConfigPath = authDir.appendingPathComponent("merged-config.yaml")
+    func saveCustomProviderAPIKey(providerID: String, apiKey: String, completion: @escaping (Bool, String) -> Void) {
+        let authDir = authDirectoryURL()
         
         do {
+            try FileManager.default.createDirectory(at: authDir, withIntermediateDirectories: true)
+        } catch {
+            completion(false, "Failed to create auth directory: \(error.localizedDescription)")
+            return
+        }
+        
+        let timestamp = ISO8601DateFormatter().string(from: Date())
+        let filename = "openai-compat-\(sanitizeFilenameComponent(providerID))-\(UUID().uuidString.prefix(8)).json"
+        let filePath = authDir.appendingPathComponent(filename)
+        let authData: [String: Any] = [
+            "type": CustomProviderConstants.authType,
+            "provider": providerID,
+            "label": maskAPIKey(apiKey),
+            "api_key": apiKey,
+            "created": timestamp
+        ]
+        
+        do {
+            let jsonData = try JSONSerialization.data(withJSONObject: authData, options: .prettyPrinted)
+            try jsonData.write(to: filePath)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: filePath.path)
+            addLog("✓ Saved API key for custom provider: \(providerID)")
+            reloadCustomProviders()
+            applyConfigUpdate()
+            completion(true, "API key saved successfully")
+        } catch {
+            completion(false, "Failed to save API key: \(error.localizedDescription)")
+        }
+    }
+    
+    @discardableResult
+    func deleteCustomProviderCredential(_ credential: CustomProviderCredential) -> Bool {
+        do {
+            try FileManager.default.removeItem(at: credential.filePath)
+            addLog("✓ Removed custom provider key: \(credential.label)")
+            reloadCustomProviders()
+            applyConfigUpdate()
+            return true
+        } catch {
+            NSLog("[ServerManager] Failed to delete custom provider credential: %@", error.localizedDescription)
+            return false
+        }
+    }
+    
+    @discardableResult
+    func toggleCustomProviderCredentialDisabled(_ credential: CustomProviderCredential) -> Bool {
+        do {
+            let data = try Data(contentsOf: credential.filePath)
+            guard var json = stringKeyedDictionary(try JSONSerialization.jsonObject(with: data)) else {
+                return false
+            }
+            
+            let currentlyDisabled = json["disabled"] as? Bool ?? false
+            json["disabled"] = !currentlyDisabled
+            let updatedData = try JSONSerialization.data(withJSONObject: json, options: [.sortedKeys])
+            try updatedData.write(to: credential.filePath, options: .atomic)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: credential.filePath.path)
+            reloadCustomProviders()
+            applyConfigUpdate()
+            return true
+        } catch {
+            NSLog("[ServerManager] Failed to toggle custom provider credential: %@", error.localizedDescription)
+            return false
+        }
+    }
+    
+    func reloadCustomProviders() {
+        guard let config = loadBaseConfigRoot() else {
+            DispatchQueue.main.async {
+                self.customProviders = []
+                self.customProviderCredentials = [:]
+            }
+            return
+        }
+        
+        let providers = parseCustomProviders(from: config.root)
+        let managedProviderIDs = Set(providers.map(\.id))
+        let credentials = Dictionary(
+            grouping: loadCustomProviderAuthRecords().filter { managedProviderIDs.contains($0.providerID) },
+            by: \.providerID
+        ).mapValues { records in
+            records
+                .sorted { $0.label.localizedCaseInsensitiveCompare($1.label) == .orderedAscending }
+                .map {
+                    CustomProviderCredential(
+                        id: $0.filePath.lastPathComponent,
+                        providerID: $0.providerID,
+                        label: $0.label,
+                        filePath: $0.filePath,
+                        isDisabled: $0.isDisabled
+                    )
+                }
+        }
+        
+        DispatchQueue.main.async {
+            self.customProviders = providers
+            self.customProviderCredentials = credentials
+        }
+    }
+    
+    /// Returns the config path to use, merging the base config with provider state and API-key auth files.
+    func getConfigPath() -> String {
+        guard let bundledConfigPath = bundledConfigPath(),
+              let baseConfig = loadBaseConfigRoot() else {
+            return ""
+        }
+        
+        let authDir = authDirectoryURL()
+        let zaiApiKeys = loadZaiAPIKeys()
+        let customAuthRecords = loadCustomProviderAuthRecords()
+        let managedCustomProviders = parseCustomProviders(from: baseConfig.root)
+        let managedCustomProviderIDs = Set(managedCustomProviders.map(\.id))
+        let disabledProviders = Self.oauthProviderKeys.compactMap { serviceKey, oauthKey in
+            isProviderEnabled(serviceKey) ? nil : oauthKey
+        }
+        let needsMergedConfig = baseConfig.isUserConfig || !zaiApiKeys.isEmpty || !disabledProviders.isEmpty
+        
+        guard needsMergedConfig else {
+            return bundledConfigPath
+        }
+        
+        var mergedRoot = baseConfig.root
+        
+        let oauthExcludedModels = buildOAuthExcludedModels(
+            from: mergedRoot["oauth-excluded-models"],
+            disabledProviders: disabledProviders
+        )
+        if let oauthExcludedModels {
+            mergedRoot["oauth-excluded-models"] = oauthExcludedModels
+        } else {
+            mergedRoot.removeValue(forKey: "oauth-excluded-models")
+        }
+        
+        let authEntriesByProviderID = Dictionary(grouping: customAuthRecords.filter { !$0.isDisabled }) { $0.providerID }
+            .mapValues { records in
+                records.map { ["api-key": $0.apiKey] }
+            }
+        
+        var mergedOpenAICompatibility: [[String: Any]] = []
+        for entry in stringKeyedDictionaryArray(mergedRoot["openai-compatibility"]) {
+            guard let providerName = entry["name"] as? String, !providerName.isEmpty else {
+                continue
+            }
+            if providerName == CustomProviderConstants.managedZAIProviderName {
+                continue
+            }
+            
+            var sanitizedEntry = stripCustomProviderUIMetadata(from: entry)
+            if managedCustomProviderIDs.contains(providerName) {
+                if !isProviderEnabled(providerName) {
+                    continue
+                }
+                
+                let inlineEntries = apiKeyEntries(from: entry)
+                let authEntries = authEntriesByProviderID[providerName] ?? []
+                let effectiveEntries = deduplicatedAPIKeyEntries(inlineEntries + authEntries)
+                guard !effectiveEntries.isEmpty else {
+                    continue
+                }
+                sanitizedEntry["api-key-entries"] = effectiveEntries
+            }
+            
+            mergedOpenAICompatibility.append(sanitizedEntry)
+        }
+        
+        if !zaiApiKeys.isEmpty && isProviderEnabled(CustomProviderConstants.managedZAIProviderName) {
+            mergedOpenAICompatibility.append(makeZAIProviderEntry(apiKeys: zaiApiKeys))
+        }
+        
+        if mergedOpenAICompatibility.isEmpty {
+            mergedRoot.removeValue(forKey: "openai-compatibility")
+        } else {
+            mergedRoot["openai-compatibility"] = mergedOpenAICompatibility
+        }
+        
+        let mergedConfigPath = authDir.appendingPathComponent(CustomProviderConstants.mergedConfigFilename)
+        do {
+            let mergedContent = try Yams.dump(object: mergedRoot)
             try mergedContent.write(to: mergedConfigPath, atomically: true, encoding: .utf8)
-            // Set secure permissions (0600 - owner read/write only) since config contains API keys
             try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: mergedConfigPath.path)
             return mergedConfigPath.path
         } catch {
             NSLog("[ServerManager] Failed to write merged config: %@", error.localizedDescription)
-            return bundledConfigPath
+            return baseConfig.path
         }
     }
     
@@ -664,6 +761,246 @@ openai-compatibility:
             // Exit code 1 means no processes found - this is fine, no need to log
         } catch {
             // Silently fail - this is not critical
+        }
+    }
+    
+    private func bundledConfigPath() -> String? {
+        guard let resourcePath = Bundle.main.resourcePath else {
+            return nil
+        }
+        return (resourcePath as NSString).appendingPathComponent("config.yaml")
+    }
+    
+    private func authDirectoryURL() -> URL {
+        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".cli-proxy-api")
+    }
+    
+    private func preferredBaseConfigPath() -> String? {
+        let userConfigPath = authDirectoryURL()
+            .appendingPathComponent(CustomProviderConstants.userConfigFilename)
+            .path
+        if FileManager.default.fileExists(atPath: userConfigPath) {
+            return userConfigPath
+        }
+        return bundledConfigPath()
+    }
+    
+    private func loadBaseConfigRoot() -> (path: String, root: [String: Any], isUserConfig: Bool)? {
+        let userConfigPath = authDirectoryURL()
+            .appendingPathComponent(CustomProviderConstants.userConfigFilename)
+            .path
+        if FileManager.default.fileExists(atPath: userConfigPath),
+           let root = loadYAMLDictionary(atPath: userConfigPath) {
+            return (path: userConfigPath, root: root, isUserConfig: true)
+        }
+        
+        guard let bundledConfigPath = bundledConfigPath(),
+              let root = loadYAMLDictionary(atPath: bundledConfigPath) else {
+            return nil
+        }
+        return (path: bundledConfigPath, root: root, isUserConfig: false)
+    }
+    
+    private func loadYAMLDictionary(atPath path: String) -> [String: Any]? {
+        do {
+            let content = try String(contentsOfFile: path, encoding: .utf8)
+            guard let loaded = try Yams.load(yaml: content) else {
+                return [:]
+            }
+            return stringKeyedDictionary(loaded)
+        } catch {
+            NSLog("[ServerManager] Failed to parse YAML at %@: %@", path, error.localizedDescription)
+            return nil
+        }
+    }
+    
+    private func parseCustomProviders(from root: [String: Any]) -> [CustomProviderDefinition] {
+        stringKeyedDictionaryArray(root["openai-compatibility"])
+            .compactMap { entry in
+                guard let providerID = entry["name"] as? String,
+                      !providerID.isEmpty,
+                      !Self.reservedCustomProviderKeys.contains(providerID) else {
+                    return nil
+                }
+                
+                let modelAliases = stringKeyedDictionaryArray(entry["models"])
+                    .compactMap { model in
+                        (model["alias"] as? String) ?? (model["name"] as? String)
+                    }
+                return CustomProviderDefinition(
+                    id: providerID,
+                    title: (entry["display-name"] as? String) ?? CustomProviderDefinition.defaultTitle(for: providerID),
+                    baseURL: entry["base-url"] as? String ?? "",
+                    helpText: entry["help-text"] as? String,
+                    iconSystemName: entry["icon-system"] as? String,
+                    modelAliases: modelAliases,
+                    inlineKeyCount: apiKeyEntries(from: entry).count
+                )
+            }
+            .sorted { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending }
+    }
+    
+    private func loadZaiAPIKeys() -> [String] {
+        guard let files = try? FileManager.default.contentsOfDirectory(at: authDirectoryURL(), includingPropertiesForKeys: nil) else {
+            return []
+        }
+        return files.compactMap { file in
+            guard file.lastPathComponent.hasPrefix("zai-"),
+                  file.pathExtension == "json",
+                  let json = readJSONFile(at: file),
+                  let apiKey = json["api_key"] as? String else {
+                return nil
+            }
+            return apiKey
+        }
+    }
+    
+    private func loadCustomProviderAuthRecords() -> [CustomProviderAuthRecord] {
+        guard let files = try? FileManager.default.contentsOfDirectory(at: authDirectoryURL(), includingPropertiesForKeys: nil) else {
+            return []
+        }
+        
+        return files.compactMap { file in
+            guard file.pathExtension == "json",
+                  let json = readJSONFile(at: file),
+                  (json["type"] as? String) == CustomProviderConstants.authType,
+                  let providerID = json["provider"] as? String,
+                  !providerID.isEmpty,
+                  let apiKey = json["api_key"] as? String else {
+                return nil
+            }
+            
+            return CustomProviderAuthRecord(
+                providerID: providerID,
+                apiKey: apiKey,
+                label: (json["label"] as? String) ?? maskAPIKey(apiKey),
+                filePath: file,
+                isDisabled: json["disabled"] as? Bool ?? false
+            )
+        }
+    }
+    
+    private func readJSONFile(at file: URL) -> [String: Any]? {
+        guard let data = try? Data(contentsOf: file),
+              let jsonObject = try? JSONSerialization.jsonObject(with: data) else {
+            return nil
+        }
+        return stringKeyedDictionary(jsonObject)
+    }
+    
+    private func stringKeyedDictionary(_ value: Any) -> [String: Any]? {
+        if let dictionary = value as? [String: Any] {
+            return dictionary
+        }
+        if let dictionary = value as? [AnyHashable: Any] {
+            var stringDictionary: [String: Any] = [:]
+            for (key, nestedValue) in dictionary {
+                guard let stringKey = key as? String else {
+                    continue
+                }
+                stringDictionary[stringKey] = nestedValue
+            }
+            return stringDictionary
+        }
+        return nil
+    }
+    
+    private func stringKeyedDictionaryArray(_ value: Any?) -> [[String: Any]] {
+        guard let array = value as? [Any] else {
+            return []
+        }
+        return array.compactMap { stringKeyedDictionary($0) }
+    }
+    
+    private func apiKeyEntries(from entry: [String: Any]) -> [[String: String]] {
+        stringKeyedDictionaryArray(entry["api-key-entries"]).compactMap { keyEntry in
+            guard let apiKey = keyEntry["api-key"] as? String else {
+                return nil
+            }
+            return ["api-key": apiKey]
+        }
+    }
+    
+    private func deduplicatedAPIKeyEntries(_ entries: [[String: String]]) -> [[String: String]] {
+        var seen: Set<String> = []
+        return entries.filter { entry in
+            guard let apiKey = entry["api-key"] else {
+                return false
+            }
+            if seen.contains(apiKey) {
+                return false
+            }
+            seen.insert(apiKey)
+            return true
+        }
+    }
+    
+    private func stripCustomProviderUIMetadata(from entry: [String: Any]) -> [String: Any] {
+        var sanitized = entry
+        for key in CustomProviderConstants.uiMetadataKeys {
+            sanitized.removeValue(forKey: key)
+        }
+        return sanitized
+    }
+    
+    private func buildOAuthExcludedModels(from value: Any?, disabledProviders: [String]) -> [String: Any]? {
+        var merged = stringKeyedDictionary(value ?? [:]) ?? [:]
+        for providerKey in Self.oauthProviderKeys.values {
+            merged.removeValue(forKey: providerKey)
+        }
+        for providerKey in disabledProviders.sorted() {
+            merged[providerKey] = ["*"]
+        }
+        return merged.isEmpty ? nil : merged
+    }
+    
+    private func makeZAIProviderEntry(apiKeys: [String]) -> [String: Any] {
+        [
+            "name": "zai",
+            "base-url": "https://api.z.ai/api/coding/paas/v4",
+            "api-key-entries": apiKeys.map { ["api-key": $0] },
+            "models": [
+                ["name": "glm-4.7", "alias": "glm-4.7"],
+                ["name": "glm-4-plus", "alias": "glm-4-plus"],
+                ["name": "glm-4-air", "alias": "glm-4-air"],
+                ["name": "glm-4-flash", "alias": "glm-4-flash"]
+            ]
+        ]
+    }
+    
+    private func maskAPIKey(_ apiKey: String) -> String {
+        guard apiKey.count > 12 else {
+            return apiKey
+        }
+        return String(apiKey.prefix(8)) + "..." + String(apiKey.suffix(4))
+    }
+    
+    private func sanitizeFilenameComponent(_ value: String) -> String {
+        let sanitized = value.replacingOccurrences(
+            of: "[^A-Za-z0-9._-]+",
+            with: "-",
+            options: .regularExpression
+        )
+        return sanitized.isEmpty ? "provider" : sanitized
+    }
+    
+    private func applyConfigUpdate() {
+        let configPath = getConfigPath()
+        guard !configPath.isEmpty else {
+            return
+        }
+        
+        let shouldRestart = isRunning && !activeConfigPath.isEmpty && activeConfigPath != configPath
+        if shouldRestart {
+            addLog("Config path changed; restarting server")
+            stop { [weak self] in
+                self?.start { _ in }
+            }
+            return
+        }
+        
+        if isRunning {
+            addLog("Config updated (hot reload)")
         }
     }
 }
