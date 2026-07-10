@@ -281,17 +281,26 @@ class ACPSubprocess:
         self._id = 0
         self._responses: dict[int, asyncio.Future] = {}
         self._reader_task: Optional[asyncio.Task] = None
-        self._text_chunks: list[str] = []
-        self._prompt_done = asyncio.Event()
-        self._prompt_result: Optional[dict] = None
-        self._current_prompt_id: Optional[int] = None
+        # Per-prompt state (keyed by prompt request id)
+        self._prompt_chunks: dict[int, list[str]] = {}
+        self._prompt_events: dict[int, asyncio.Event] = {}
+        self._prompt_results: dict[int, dict] = {}
+        self._lock = asyncio.Lock()
+        self._started = False
 
     def _next_id(self) -> int:
         self._id += 1
         return self._id
 
     async def start(self):
-        """Spawn the devin acp subprocess and start the reader loop."""
+        """Spawn the devin acp subprocess, initialise, and authenticate once.
+
+        Idempotent — no-op if already started.  The subprocess stays
+        alive for the lifetime of the bridge, so authenticate happens
+        only once and all subsequent prompts reuse the connection.
+        """
+        if self._started:
+            return
         self.proc = await asyncio.create_subprocess_exec(
             self.devin_bin, "acp",
             stdin=asyncio.subprocess.PIPE,
@@ -316,6 +325,7 @@ class ACPSubprocess:
         })
         if "error" in resp:
             raise RuntimeError(f"authenticate failed: {resp['error']}")
+        self._started = True
 
     async def _reader_loop(self):
         """Background task that reads lines from stdout and dispatches."""
@@ -334,16 +344,21 @@ class ACPSubprocess:
                 fut = self._responses.pop(msg["id"], None)
                 if fut and not fut.done():
                     fut.set_result(msg)
-                # Check if this is the prompt response
-                if msg["id"] == self._current_prompt_id:
-                    self._prompt_result = msg
-                    self._prompt_done.set()
+                # Check if this is a prompt response
+                if msg["id"] in self._prompt_events:
+                    self._prompt_results[msg["id"]] = msg
+                    self._prompt_events[msg["id"]].set()
             elif "method" in msg:
-                # This is a notification
+                # This is a notification — route to the active prompt
                 self._handle_notification(msg)
 
     def _handle_notification(self, msg: dict):
-        """Handle ACP notifications (session/update, etc.)."""
+        """Handle ACP notifications (session/update, etc.).
+
+        Routes agent_message_chunk text to the currently-active prompt's
+        chunk list.  Because prompts are serialised by _lock, there is at
+        most one active prompt at a time.
+        """
         method = msg.get("method", "")
         if method == "session/update":
             params = msg.get("params", {})
@@ -352,7 +367,9 @@ class ACPSubprocess:
             if kind == "agent_message_chunk":
                 content = update.get("content", {})
                 if content.get("type") == "text":
-                    self._text_chunks.append(content.get("text", ""))
+                    # Append to whichever prompt is currently active
+                    for pid, chunks in self._prompt_chunks.items():
+                        chunks.append(content.get("text", ""))
 
     async def _send_request(self, method: str, params: dict) -> dict:
         """Send a JSON-RPC request and wait for the response."""
@@ -394,37 +411,57 @@ class ACPSubprocess:
             # Ignore errors — fall back to default model
         return sid
 
-    async def send_prompt(self, session_id: str, prompt: str) -> dict:
-        """Send a prompt and wait for completion. Returns the prompt result."""
-        self._text_chunks.clear()
-        self._prompt_done.clear()
-        self._prompt_result = None
-        mid = str(uuid.uuid4())
-        self._current_prompt_id = self._next_id()
-        msg = {
-            "jsonrpc": "2.0",
-            "id": self._current_prompt_id,
-            "method": "session/prompt",
-            "params": {
-                "sessionId": session_id,
-                "messageId": mid,
-                "prompt": [{"type": "text", "text": prompt}],
-            },
-        }
-        self._responses[self._current_prompt_id] = asyncio.get_event_loop().create_future()
-        data = (json.dumps(msg) + "\n").encode()
-        self.proc.stdin.write(data)
-        await self.proc.stdin.drain()
+    async def send_prompt(self, session_id: str, prompt: str) -> tuple[str, dict]:
+        """Send a prompt, wait for completion, and return (text, usage).
 
-        # Wait for the prompt response (notifications fill _text_chunks)
-        await asyncio.wait_for(self._prompt_done.wait(), timeout=300)
-        return self._prompt_result or {}
+        Serialised by _lock so only one prompt is active at a time
+        (the ACP notification stream routes agent_message_chunk text
+        to the currently-active prompt).
+        """
+        async with self._lock:
+            # Per-prompt state
+            rid = self._next_id()
+            self._prompt_chunks[rid] = []
+            self._prompt_events[rid] = asyncio.Event()
+            mid = str(uuid.uuid4())
+            msg = {
+                "jsonrpc": "2.0",
+                "id": rid,
+                "method": "session/prompt",
+                "params": {
+                    "sessionId": session_id,
+                    "messageId": mid,
+                    "prompt": [{"type": "text", "text": prompt}],
+                },
+            }
+            self._responses[rid] = asyncio.get_event_loop().create_future()
+            data = (json.dumps(msg) + "\n").encode()
+            self.proc.stdin.write(data)
+            await self.proc.stdin.drain()
 
-    def get_text(self) -> str:
-        return "".join(self._text_chunks)
+            # Wait for the prompt response (notifications fill _prompt_chunks[rid])
+            await asyncio.wait_for(self._prompt_events[rid].wait(), timeout=300)
+            result = self._prompt_results.pop(rid, {})
+            text = "".join(self._prompt_chunks.pop(rid, []))
+            self._prompt_events.pop(rid, None)
+            self._responses.pop(rid, None)
+            usage = result.get("result", {}).get("usage", {})
+            return text, usage
+
+    async def prompt(self, model: Optional[str], prompt: str) -> tuple[str, dict]:
+        """High-level: ensure started, create session, set model, send prompt.
+
+        Returns (text, usage).  This is the main entry point for the
+        FastAPI handlers — the subprocess stays alive across calls so
+        authenticate only happens once.
+        """
+        await self.start()  # idempotent — no-op if already started
+        sid = await self.new_session(model=model)
+        return await self.send_prompt(sid, prompt)
 
     async def stop(self):
         """Terminate the subprocess."""
+        self._started = False
         if self._reader_task:
             self._reader_task.cancel()
         if self.proc:
@@ -506,8 +543,20 @@ app = FastAPI(title="Devin OpenAI Bridge", version="1.0.0")
 # Global config (set in main)
 _config: dict = {}
 
+# Global persistent ACP client — started once, reused for all prompts.
+# This eliminates per-request OAuth/subprocess-spawn overhead.
+_acp_client: Optional[ACPSubprocess] = None
+
 def get_config() -> dict:
     return _config
+
+def get_acp_client() -> ACPSubprocess:
+    """Return the singleton ACPSubprocess (created lazily on first use)."""
+    global _acp_client
+    if _acp_client is None:
+        cfg = get_config()
+        _acp_client = ACPSubprocess(cfg["token"], cfg["devin_bin"])
+    return _acp_client
 
 @app.get("/v1/models")
 async def list_models():
@@ -520,37 +569,29 @@ async def chat_completions(request: Request):
     model = body.get("model", "claude-sonnet-4-6")
     stream = body.get("stream", False)
 
-    cfg = get_config()
-    token = cfg["token"]
-    devin_bin = cfg["devin_bin"]
-
     prompt_text = messages_to_prompt(messages)
 
     if stream:
         return StreamingResponse(
-            _stream_completion(token, devin_bin, model, prompt_text),
+            _stream_completion(model, prompt_text),
             media_type="text/event-stream",
         )
     else:
-        return await _non_stream_completion(token, devin_bin, model, prompt_text)
+        return await _non_stream_completion(model, prompt_text)
 
-async def _run_acp_prompt(token: str, devin_bin: str, model: str, prompt: str) -> tuple[str, dict]:
-    """Run a single ACP session and return (text, usage_info)."""
-    client = ACPSubprocess(token, devin_bin)
-    try:
-        await client.start()
-        sid = await client.new_session(model=model)
-        result = await client.send_prompt(sid, prompt)
-        text = client.get_text()
-        usage = result.get("result", {}).get("usage", {})
-        return text, usage
-    finally:
-        await client.stop()
+async def _run_acp_prompt(model: str, prompt: str) -> tuple[str, dict]:
+    """Run a prompt via the persistent ACP client. Returns (text, usage).
 
-async def _stream_completion(token: str, devin_bin: str, model: str, prompt: str):
+    The subprocess is started and authenticated once (on first call);
+    subsequent calls reuse it, so OAuth only happens once.
+    """
+    client = get_acp_client()
+    return await client.prompt(model=model, prompt=prompt)
+
+async def _stream_completion(model: str, prompt: str):
     """Stream OpenAI SSE chunks from Devin ACP."""
     try:
-        text, usage = await _run_acp_prompt(token, devin_bin, model, prompt)
+        text, usage = await _run_acp_prompt(model, prompt)
         # Stream the text as a single chunk (ACP doesn't support true streaming
         # via subprocess, but we emit it as SSE for OpenAI compatibility)
         if text:
@@ -560,10 +601,10 @@ async def _stream_completion(token: str, devin_bin: str, model: str, prompt: str
     except Exception as e:
         yield _sse_error({"message": str(e)})
 
-async def _non_stream_completion(token: str, devin_bin: str, model: str, prompt: str) -> JSONResponse:
+async def _non_stream_completion(model: str, prompt: str) -> JSONResponse:
     """Collect all text and return a single OpenAI response."""
     try:
-        text, usage = await _run_acp_prompt(token, devin_bin, model, prompt)
+        text, usage = await _run_acp_prompt(model, prompt)
         return JSONResponse({
             "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
             "object": "chat.completion",
@@ -599,6 +640,26 @@ def _sse_error(error: dict) -> str:
 @app.get("/health")
 async def health():
     return {"status": "ok", "service": "devin-bridge"}
+
+@app.on_event("startup")
+async def _prewarm_acp():
+    """Pre-warm the ACP subprocess at bridge startup.
+
+    Spawns `devin acp`, initialises, and authenticates immediately so
+    the first user request doesn't pay the OAuth/subprocess-spawn cost.
+    Runs in the background — doesn't block server startup.
+    """
+    cfg = get_config()
+    if not cfg.get("token") or not cfg.get("devin_bin"):
+        return
+    async def _warm():
+        try:
+            client = get_acp_client()
+            await client.start()
+            print(f"[devin-bridge] ACP subprocess pre-warmed (authenticated, ready for prompts)")
+        except Exception as e:
+            print(f"[devin-bridge] Pre-warm failed (will retry on first request): {e}")
+    asyncio.create_task(_warm())
 
 # ---------------------------------------------------------------------------
 # Main
