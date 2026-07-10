@@ -11,10 +11,16 @@ final class ProviderWiringTests: XCTestCase {
         XCTAssertEqual(ServiceType.qwen.connectionAction, .promptForQwenEmail)
         XCTAssertEqual(ServiceType.antigravity.connectionAction, .authCommand(.antigravityLogin))
         XCTAssertEqual(ServiceType.zai.connectionAction, .promptForZAIAPIKey)
+        XCTAssertEqual(ServiceType.devin.connectionAction, .promptForDevinAuth)
     }
 
     func testKimiProviderCatalogRegistrationMatchesRuntimeProviderKey() {
         XCTAssertEqual(ProviderCatalog.oauthProviderKeys["kimi"], "kimi")
         XCTAssertTrue(ProviderCatalog.reservedCustomProviderKeys.contains("kimi"))
+    }
+
+    func testDevinProviderCatalogRegistrationMatchesRuntimeProviderKey() {
+        XCTAssertEqual(ProviderCatalog.managedDevinProviderName, "devin")
+        XCTAssertTrue(ProviderCatalog.reservedCustomProviderKeys.contains("devin"))
     }
 }

@@ -105,7 +105,9 @@ enum ConfigComposer {
                 seenProviderIDs.insert(providerID)
             }
 
-            if reservedProviderIDs.contains(providerID), providerID != ProviderCatalog.managedZAIProviderName {
+            if reservedProviderIDs.contains(providerID),
+               providerID != ProviderCatalog.managedZAIProviderName,
+               providerID != ProviderCatalog.managedDevinProviderName {
                 errors.append("Provider '\(providerID)' is reserved and cannot be declared under openai-compatibility.")
                 continue
             }
@@ -132,7 +134,8 @@ enum ConfigComposer {
                 }
             }
 
-            if providerID == ProviderCatalog.managedZAIProviderName {
+            if providerID == ProviderCatalog.managedZAIProviderName
+                || providerID == ProviderCatalog.managedDevinProviderName {
                 continue
             }
 
@@ -153,7 +156,9 @@ enum ConfigComposer {
         zaiAPIKeys: [String],
         customProviderAuthRecords: [ConfigProviderAuthRecord],
         includeManagedZAIProvider: Bool,
-        managedZAIProviderName: String = "zai"
+        managedZAIProviderName: String = "zai",
+        includeManagedDevinProvider: Bool = true,
+        managedDevinProviderName: String = "devin"
     ) -> [String: Any] {
         var mergedRoot = baseRoot
         
@@ -179,6 +184,7 @@ enum ConfigComposer {
         
         var mergedOpenAICompatibility: [[String: Any]] = []
         var managedZAIBaseEntry: [String: Any]?
+        var managedDevinBaseEntry: [String: Any]?
         for entry in stringKeyedDictionaryArray(mergedRoot["openai-compatibility"]) {
             guard let providerName = normalizedProviderID(from: entry) else {
                 continue
@@ -190,12 +196,16 @@ enum ConfigComposer {
                 managedZAIBaseEntry = sanitizedEntry
                 continue
             }
-            
+            if providerName == managedDevinProviderName {
+                managedDevinBaseEntry = sanitizedEntry
+                continue
+            }
+
             if managedCustomProviderIDs.contains(providerName) {
                 if disabledCustomProviderIDs.contains(providerName) {
                     continue
                 }
-                
+
                 let inlineEntries = apiKeyEntries(from: entry)
                 let authEntries = authEntriesByProviderID[providerName] ?? []
                 let effectiveEntries = deduplicatedAPIKeyEntries(inlineEntries + authEntries)
@@ -204,10 +214,10 @@ enum ConfigComposer {
                 }
                 sanitizedEntry["api-key-entries"] = effectiveEntries
             }
-            
+
             mergedOpenAICompatibility.append(sanitizedEntry)
         }
-        
+
         if includeManagedZAIProvider {
             let managedZAIEntry = makeZAIProviderEntry(
                 baseEntry: managedZAIBaseEntry,
@@ -215,6 +225,15 @@ enum ConfigComposer {
             )
             if !apiKeyEntries(from: managedZAIEntry).isEmpty {
                 mergedOpenAICompatibility.append(managedZAIEntry)
+            }
+        }
+
+        if includeManagedDevinProvider {
+            let managedDevinEntry = makeDevinProviderEntry(
+                baseEntry: managedDevinBaseEntry
+            )
+            if managedDevinEntry["base-url"] != nil {
+                mergedOpenAICompatibility.append(managedDevinEntry)
             }
         }
         
@@ -406,6 +425,178 @@ enum ConfigComposer {
         }
 
         return entry
+    }
+
+    private static func makeDevinProviderEntry(baseEntry: [String: Any]?) -> [String: Any] {
+        var entry = stripCustomProviderUIMetadata(from: baseEntry ?? [:])
+        entry["name"] = "devin"
+
+        if normalizedString(entry["base-url"]) == nil {
+            entry["base-url"] = "http://127.0.0.1:8419/v1"
+        }
+
+        // The Devin bridge doesn't require API keys in the config —
+        // it reads credentials from ~/.devin/credentials.toml directly.
+        // We use a placeholder key so CLIProxyAPIPlus will route to it.
+        if apiKeyEntries(from: entry).isEmpty {
+            entry["api-key-entries"] = [["api-key": "devin-bridge-no-key-needed"]]
+        }
+
+        if stringKeyedDictionaryArray(entry["models"]).isEmpty {
+            entry["models"] = defaultDevinModels()
+        }
+
+        return entry
+    }
+
+    private static func defaultDevinModels() -> [[String: String]] {
+        // 142 models fetched live from Devin ACP session/new configOptions
+        // (2026-07-10). Includes GLM-5.2, Kimi K2.7, Grok 4.5, DeepSeek V4,
+        // Claude Opus 4.8, GPT-5.6 Sol/Luna/Terra, SWE-1.7, etc.
+        [
+            ["name": "claude-opus-4-8-medium", "alias": "devin-claude-opus-4-8-medium"],
+            ["name": "claude-opus-4-8-low", "alias": "devin-claude-opus-4-8-low"],
+            ["name": "claude-opus-4-8-high", "alias": "devin-claude-opus-4-8-high"],
+            ["name": "claude-opus-4-8-xhigh", "alias": "devin-claude-opus-4-8-xhigh"],
+            ["name": "claude-opus-4-8-max", "alias": "devin-claude-opus-4-8-max"],
+            ["name": "claude-opus-4-8-low-fast", "alias": "devin-claude-opus-4-8-low-fast"],
+            ["name": "claude-opus-4-8-medium-fast", "alias": "devin-claude-opus-4-8-medium-fast"],
+            ["name": "claude-opus-4-8-high-fast", "alias": "devin-claude-opus-4-8-high-fast"],
+            ["name": "claude-opus-4-8-xhigh-fast", "alias": "devin-claude-opus-4-8-xhigh-fast"],
+            ["name": "claude-opus-4-8-max-fast", "alias": "devin-claude-opus-4-8-max-fast"],
+            ["name": "claude-5-fable-medium", "alias": "devin-claude-5-fable-medium"],
+            ["name": "claude-5-fable-low", "alias": "devin-claude-5-fable-low"],
+            ["name": "claude-5-fable-high", "alias": "devin-claude-5-fable-high"],
+            ["name": "claude-5-fable-xhigh", "alias": "devin-claude-5-fable-xhigh"],
+            ["name": "claude-5-fable-max", "alias": "devin-claude-5-fable-max"],
+            ["name": "claude-sonnet-5-medium", "alias": "devin-claude-sonnet-5-medium"],
+            ["name": "claude-sonnet-5-low", "alias": "devin-claude-sonnet-5-low"],
+            ["name": "claude-sonnet-5-high", "alias": "devin-claude-sonnet-5-high"],
+            ["name": "claude-sonnet-5-xhigh", "alias": "devin-claude-sonnet-5-xhigh"],
+            ["name": "claude-sonnet-5-max", "alias": "devin-claude-sonnet-5-max"],
+            ["name": "gpt-5-6-sol-medium", "alias": "devin-gpt-5-6-sol-medium"],
+            ["name": "gpt-5-6-sol-none", "alias": "devin-gpt-5-6-sol-none"],
+            ["name": "gpt-5-6-sol-low", "alias": "devin-gpt-5-6-sol-low"],
+            ["name": "gpt-5-6-sol-high", "alias": "devin-gpt-5-6-sol-high"],
+            ["name": "gpt-5-6-sol-xhigh", "alias": "devin-gpt-5-6-sol-xhigh"],
+            ["name": "gpt-5-6-sol-max", "alias": "devin-gpt-5-6-sol-max"],
+            ["name": "gpt-5-6-sol-none-priority", "alias": "devin-gpt-5-6-sol-none-priority"],
+            ["name": "gpt-5-6-sol-low-priority", "alias": "devin-gpt-5-6-sol-low-priority"],
+            ["name": "gpt-5-6-sol-medium-priority", "alias": "devin-gpt-5-6-sol-medium-priority"],
+            ["name": "gpt-5-6-sol-high-priority", "alias": "devin-gpt-5-6-sol-high-priority"],
+            ["name": "gpt-5-6-sol-xhigh-priority", "alias": "devin-gpt-5-6-sol-xhigh-priority"],
+            ["name": "gpt-5-6-luna-medium", "alias": "devin-gpt-5-6-luna-medium"],
+            ["name": "gpt-5-6-luna-none", "alias": "devin-gpt-5-6-luna-none"],
+            ["name": "gpt-5-6-luna-low", "alias": "devin-gpt-5-6-luna-low"],
+            ["name": "gpt-5-6-luna-high", "alias": "devin-gpt-5-6-luna-high"],
+            ["name": "gpt-5-6-luna-xhigh", "alias": "devin-gpt-5-6-luna-xhigh"],
+            ["name": "gpt-5-6-luna-max", "alias": "devin-gpt-5-6-luna-max"],
+            ["name": "gpt-5-6-luna-none-priority", "alias": "devin-gpt-5-6-luna-none-priority"],
+            ["name": "gpt-5-6-luna-low-priority", "alias": "devin-gpt-5-6-luna-low-priority"],
+            ["name": "gpt-5-6-luna-medium-priority", "alias": "devin-gpt-5-6-luna-medium-priority"],
+            ["name": "gpt-5-6-luna-high-priority", "alias": "devin-gpt-5-6-luna-high-priority"],
+            ["name": "gpt-5-6-luna-xhigh-priority", "alias": "devin-gpt-5-6-luna-xhigh-priority"],
+            ["name": "glm-5-2", "alias": "devin-glm-5-2"],
+            ["name": "glm-5-2-max", "alias": "devin-glm-5-2-max"],
+            ["name": "glm-5-2-1m", "alias": "devin-glm-5-2-1m"],
+            ["name": "glm-5-2-max-1m", "alias": "devin-glm-5-2-max-1m"],
+            ["name": "glm-5-2-none", "alias": "devin-glm-5-2-none"],
+            ["name": "glm-5-2-none-1m", "alias": "devin-glm-5-2-none-1m"],
+            ["name": "kimi-k2-7", "alias": "devin-kimi-k2-7"],
+            ["name": "swe-1-7", "alias": "devin-swe-1-7"],
+            ["name": "swe-1-7-lightning", "alias": "devin-swe-1-7-lightning"],
+            ["name": "adaptive", "alias": "devin-adaptive"],
+            ["name": "claude-opus-4-7-medium", "alias": "devin-claude-opus-4-7-medium"],
+            ["name": "claude-opus-4-7-low", "alias": "devin-claude-opus-4-7-low"],
+            ["name": "claude-opus-4-7-high", "alias": "devin-claude-opus-4-7-high"],
+            ["name": "claude-opus-4-7-xhigh", "alias": "devin-claude-opus-4-7-xhigh"],
+            ["name": "claude-opus-4-7-max", "alias": "devin-claude-opus-4-7-max"],
+            ["name": "claude-opus-4-7-low-fast", "alias": "devin-claude-opus-4-7-low-fast"],
+            ["name": "claude-opus-4-7-medium-fast", "alias": "devin-claude-opus-4-7-medium-fast"],
+            ["name": "claude-opus-4-7-high-fast", "alias": "devin-claude-opus-4-7-high-fast"],
+            ["name": "claude-opus-4-7-xhigh-fast", "alias": "devin-claude-opus-4-7-xhigh-fast"],
+            ["name": "claude-opus-4-7-max-fast", "alias": "devin-claude-opus-4-7-max-fast"],
+            ["name": "gemini-3-5-flash-minimal", "alias": "devin-gemini-3-5-flash-minimal"],
+            ["name": "gemini-3-5-flash-low", "alias": "devin-gemini-3-5-flash-low"],
+            ["name": "gemini-3-5-flash-medium", "alias": "devin-gemini-3-5-flash-medium"],
+            ["name": "gemini-3-5-flash-high", "alias": "devin-gemini-3-5-flash-high"],
+            ["name": "gpt-5-6-terra-none", "alias": "devin-gpt-5-6-terra-none"],
+            ["name": "gpt-5-6-terra-low", "alias": "devin-gpt-5-6-terra-low"],
+            ["name": "gpt-5-6-terra-medium", "alias": "devin-gpt-5-6-terra-medium"],
+            ["name": "gpt-5-6-terra-high", "alias": "devin-gpt-5-6-terra-high"],
+            ["name": "gpt-5-6-terra-xhigh", "alias": "devin-gpt-5-6-terra-xhigh"],
+            ["name": "gpt-5-6-terra-max", "alias": "devin-gpt-5-6-terra-max"],
+            ["name": "gpt-5-6-terra-none-priority", "alias": "devin-gpt-5-6-terra-none-priority"],
+            ["name": "gpt-5-6-terra-low-priority", "alias": "devin-gpt-5-6-terra-low-priority"],
+            ["name": "gpt-5-6-terra-medium-priority", "alias": "devin-gpt-5-6-terra-medium-priority"],
+            ["name": "gpt-5-6-terra-high-priority", "alias": "devin-gpt-5-6-terra-high-priority"],
+            ["name": "gpt-5-6-terra-xhigh-priority", "alias": "devin-gpt-5-6-terra-xhigh-priority"],
+            ["name": "grok-4-5-low", "alias": "devin-grok-4-5-low"],
+            ["name": "grok-4-5-medium", "alias": "devin-grok-4-5-medium"],
+            ["name": "grok-4-5-high", "alias": "devin-grok-4-5-high"],
+            ["name": "claude-opus-4-6", "alias": "devin-claude-opus-4-6"],
+            ["name": "claude-opus-4-6-thinking", "alias": "devin-claude-opus-4-6-thinking"],
+            ["name": "claude-opus-4-6-1m", "alias": "devin-claude-opus-4-6-1m"],
+            ["name": "claude-opus-4-6-thinking-1m", "alias": "devin-claude-opus-4-6-thinking-1m"],
+            ["name": "gpt-5-4-none", "alias": "devin-gpt-5-4-none"],
+            ["name": "gpt-5-4-low", "alias": "devin-gpt-5-4-low"],
+            ["name": "gpt-5-4-medium", "alias": "devin-gpt-5-4-medium"],
+            ["name": "gpt-5-4-high", "alias": "devin-gpt-5-4-high"],
+            ["name": "gpt-5-4-xhigh", "alias": "devin-gpt-5-4-xhigh"],
+            ["name": "gpt-5-4-none-priority", "alias": "devin-gpt-5-4-none-priority"],
+            ["name": "gpt-5-4-low-priority", "alias": "devin-gpt-5-4-low-priority"],
+            ["name": "gpt-5-4-medium-priority", "alias": "devin-gpt-5-4-medium-priority"],
+            ["name": "gpt-5-4-high-priority", "alias": "devin-gpt-5-4-high-priority"],
+            ["name": "gpt-5-4-xhigh-priority", "alias": "devin-gpt-5-4-xhigh-priority"],
+            ["name": "gpt-5-5-none", "alias": "devin-gpt-5-5-none"],
+            ["name": "gpt-5-5-low", "alias": "devin-gpt-5-5-low"],
+            ["name": "gpt-5-5-medium", "alias": "devin-gpt-5-5-medium"],
+            ["name": "gpt-5-5-high", "alias": "devin-gpt-5-5-high"],
+            ["name": "gpt-5-5-xhigh", "alias": "devin-gpt-5-5-xhigh"],
+            ["name": "gpt-5-5-none-priority", "alias": "devin-gpt-5-5-none-priority"],
+            ["name": "gpt-5-5-low-priority", "alias": "devin-gpt-5-5-low-priority"],
+            ["name": "gpt-5-5-medium-priority", "alias": "devin-gpt-5-5-medium-priority"],
+            ["name": "gpt-5-5-high-priority", "alias": "devin-gpt-5-5-high-priority"],
+            ["name": "gpt-5-5-xhigh-priority", "alias": "devin-gpt-5-5-xhigh-priority"],
+            ["name": "gpt-5-4-mini-low", "alias": "devin-gpt-5-4-mini-low"],
+            ["name": "gpt-5-4-mini-medium", "alias": "devin-gpt-5-4-mini-medium"],
+            ["name": "gpt-5-4-mini-high", "alias": "devin-gpt-5-4-mini-high"],
+            ["name": "gpt-5-4-mini-xhigh", "alias": "devin-gpt-5-4-mini-xhigh"],
+            ["name": "claude-sonnet-4-6", "alias": "devin-claude-sonnet-4-6"],
+            ["name": "claude-sonnet-4-6-thinking", "alias": "devin-claude-sonnet-4-6-thinking"],
+            ["name": "claude-sonnet-4-6-1m", "alias": "devin-claude-sonnet-4-6-1m"],
+            ["name": "claude-sonnet-4-6-thinking-1m", "alias": "devin-claude-sonnet-4-6-thinking-1m"],
+            ["name": "MODEL_GPT_5_2_LOW", "alias": "devin-MODEL_GPT_5_2_LOW"],
+            ["name": "MODEL_GPT_5_2_MEDIUM", "alias": "devin-MODEL_GPT_5_2_MEDIUM"],
+            ["name": "MODEL_GPT_5_2_NONE", "alias": "devin-MODEL_GPT_5_2_NONE"],
+            ["name": "MODEL_GPT_5_2_HIGH", "alias": "devin-MODEL_GPT_5_2_HIGH"],
+            ["name": "MODEL_GPT_5_2_XHIGH", "alias": "devin-MODEL_GPT_5_2_XHIGH"],
+            ["name": "MODEL_CLAUDE_4_5_OPUS", "alias": "devin-MODEL_CLAUDE_4_5_OPUS"],
+            ["name": "MODEL_CLAUDE_4_5_OPUS_THINKING", "alias": "devin-MODEL_CLAUDE_4_5_OPUS_THINKING"],
+            ["name": "MODEL_SWE_1_5", "alias": "devin-MODEL_SWE_1_5"],
+            ["name": "MODEL_SWE_1_5_SLOW", "alias": "devin-MODEL_SWE_1_5_SLOW"],
+            ["name": "MODEL_PRIVATE_11", "alias": "devin-MODEL_PRIVATE_11"],
+            ["name": "MODEL_PRIVATE_2", "alias": "devin-MODEL_PRIVATE_2"],
+            ["name": "MODEL_PRIVATE_3", "alias": "devin-MODEL_PRIVATE_3"],
+            ["name": "gpt-5-3-codex-low", "alias": "devin-gpt-5-3-codex-low"],
+            ["name": "gpt-5-3-codex-medium", "alias": "devin-gpt-5-3-codex-medium"],
+            ["name": "gpt-5-3-codex-high", "alias": "devin-gpt-5-3-codex-high"],
+            ["name": "gpt-5-3-codex-xhigh", "alias": "devin-gpt-5-3-codex-xhigh"],
+            ["name": "gpt-5-3-codex-low-priority", "alias": "devin-gpt-5-3-codex-low-priority"],
+            ["name": "gpt-5-3-codex-medium-priority", "alias": "devin-gpt-5-3-codex-medium-priority"],
+            ["name": "gpt-5-3-codex-high-priority", "alias": "devin-gpt-5-3-codex-high-priority"],
+            ["name": "gpt-5-3-codex-xhigh-priority", "alias": "devin-gpt-5-3-codex-xhigh-priority"],
+            ["name": "kimi-k2-6", "alias": "devin-kimi-k2-6"],
+            ["name": "swe-1-6", "alias": "devin-swe-1-6"],
+            ["name": "swe-1-6-fast", "alias": "devin-swe-1-6-fast"],
+            ["name": "gemini-3-1-pro-low", "alias": "devin-gemini-3-1-pro-low"],
+            ["name": "gemini-3-1-pro-high", "alias": "devin-gemini-3-1-pro-high"],
+            ["name": "MODEL_GOOGLE_GEMINI_3_0_FLASH_MINIMAL", "alias": "devin-MODEL_GOOGLE_GEMINI_3_0_FLASH_MINIMAL"],
+            ["name": "MODEL_GOOGLE_GEMINI_3_0_FLASH_LOW", "alias": "devin-MODEL_GOOGLE_GEMINI_3_0_FLASH_LOW"],
+            ["name": "MODEL_GOOGLE_GEMINI_3_0_FLASH_MEDIUM", "alias": "devin-MODEL_GOOGLE_GEMINI_3_0_FLASH_MEDIUM"],
+            ["name": "MODEL_GOOGLE_GEMINI_3_0_FLASH_HIGH", "alias": "devin-MODEL_GOOGLE_GEMINI_3_0_FLASH_HIGH"],
+            ["name": "deepseek-v4", "alias": "devin-deepseek-v4"],
+        ]
     }
 
     private static func normalizedProviderID(from entry: [String: Any]) -> String? {

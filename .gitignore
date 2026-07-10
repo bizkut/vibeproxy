@@ -31,3 +31,7 @@ src/Sources/Resources/AppIcon.iconset/
 *.log
 test-notarization.sh
 .vscode/settings.json
+
+# Python (devin-bridge)
+__pycache__/
+*.pyc

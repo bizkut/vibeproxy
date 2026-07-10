@@ -10,6 +10,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUserNoti
     weak var settingsWindow: NSWindow?
     var serverManager: ServerManager!
     var thinkingProxy: ThinkingProxy!
+    var devinBridge: DevinBridgeManager!
     private let notificationCenter = UNUserNotificationCenter.current()
     private var notificationPermissionGranted = false
     private let updaterController: SPUStandardUpdaterController
@@ -34,6 +35,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUserNoti
         // Initialize managers
         serverManager = ServerManager()
         thinkingProxy = ThinkingProxy()
+        devinBridge = DevinBridgeManager()
 
         // Sync Vercel AI Gateway config from ServerManager to ThinkingProxy
         syncVercelConfig()
@@ -212,7 +214,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUserNoti
         window.delegate = self
         window.isReleasedWhenClosed = false
 
-        let contentView = SettingsView(serverManager: serverManager)
+        let contentView = SettingsView(serverManager: serverManager, devinBridge: devinBridge)
         window.contentView = NSHostingView(rootView: contentView)
 
         settingsWindow = window
@@ -235,7 +237,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUserNoti
     func startServer() {
         // Start the thinking proxy first (port 8317)
         thinkingProxy.start()
-        
+
+        // Start the Devin bridge (port 8419) if credentials exist
+        if DevinBridgeManager.hasCredentials() {
+            devinBridge.start()
+        }
+
         // Poll for thinking proxy readiness with timeout
         pollForProxyReadiness(attempts: 0, maxAttempts: 60, intervalMs: 50)
     }
@@ -280,7 +287,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUserNoti
     func stopServer() {
         // Stop the thinking proxy first to stop accepting new requests
         thinkingProxy.stop()
-        
+
+        // Stop the Devin bridge
+        devinBridge.stop()
+
         // Then stop CLIProxyAPI backend
         serverManager.stop()
         

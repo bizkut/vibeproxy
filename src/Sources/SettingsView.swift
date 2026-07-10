@@ -505,8 +505,86 @@ struct CustomProviderRow: View {
     }
 }
 
+/// Devin provider row — shows bridge status and auth info
+struct DevinServiceRow: View {
+    let isAuthenticating: Bool
+    let hasCredentials: Bool
+    let isEnabled: Bool
+    let bridgeRunning: Bool
+    let bridgeStatus: String
+    let onConnect: () -> Void
+    let onToggleEnabled: (Bool) -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Toggle("", isOn: Binding(
+                    get: { isEnabled },
+                    set: { onToggleEnabled($0) }
+                ))
+                .toggleStyle(.switch)
+                .controlSize(.mini)
+                .labelsHidden()
+                .help(isEnabled ? "Disable Devin" : "Enable Devin")
+
+                Image(systemName: "brain.head.profile")
+                    .frame(width: 20, height: 20)
+                    .opacity(isEnabled ? 1.0 : 0.4)
+
+                Text("Devin")
+                    .fontWeight(.medium)
+                    .foregroundColor(isEnabled ? .primary : .secondary)
+
+                Spacer()
+
+                if isAuthenticating {
+                    ProgressView()
+                        .controlSize(.small)
+                } else if isEnabled {
+                    Button("Setup") {
+                        onConnect()
+                    }
+                    .controlSize(.small)
+                }
+            }
+
+            if isEnabled {
+                HStack(spacing: 6) {
+                    Circle()
+                        .fill(bridgeRunning ? Color.green : (hasCredentials ? Color.orange : Color.gray))
+                        .frame(width: 6, height: 6)
+                    if !hasCredentials {
+                        Text("Not authenticated — run `devin auth` or set DEVIN_OUTPOSTS_TOKEN")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    } else if bridgeRunning {
+                        Text("Bridge running (port 8419)")
+                            .font(.caption)
+                            .foregroundColor(.green)
+                    } else {
+                        Text("Bridge: \(bridgeStatus)")
+                            .font(.caption)
+                            .foregroundColor(.orange)
+                    }
+                }
+                .padding(.leading, 28)
+
+                if hasCredentials {
+                    Text("142 models: devin-glm-5-2, devin-kimi-k2-7, devin-claude-opus-4-8, devin-gpt-5-6-sol, devin-grok-4-5, devin-deepseek-v4, etc.")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                        .padding(.leading, 28)
+                }
+            }
+        }
+        .padding(.vertical, 4)
+        .help("Devin AI — use your Devin subscription via ACP WebSocket bridge")
+    }
+}
+
 struct SettingsView: View {
     @ObservedObject var serverManager: ServerManager
+    @ObservedObject var devinBridge: DevinBridgeManager
     @StateObject private var authManager = AuthManager()
     @State private var launchAtLogin = false
     @State private var authenticatingService: ServiceType? = nil
@@ -518,6 +596,7 @@ struct SettingsView: View {
     @State private var qwenEmail = ""
     @State private var showingZaiApiKeyPrompt = false
     @State private var zaiApiKey = ""
+    @State private var showingDevinAuthInfo = false
     @State private var selectedCustomProvider: CustomProviderDefinition?
     @State private var customProviderApiKey = ""
     @State private var expandedRowCount = 0
@@ -735,6 +814,22 @@ struct SettingsView: View {
                         onToggleEnabled: { enabled in serverManager.setProviderEnabled("zai", enabled: enabled) },
                         onExpandChange: { expanded in expandedRowCount += expanded ? 1 : -1 }
                     ) { EmptyView() }
+
+                    // Devin provider (OpenAI-compatible bridge to Devin ACP)
+                    DevinServiceRow(
+                        isAuthenticating: authenticatingService == .devin,
+                        hasCredentials: DevinBridgeManager.hasCredentials(),
+                        isEnabled: serverManager.isProviderEnabled("devin"),
+                        bridgeRunning: devinBridge.isRunning,
+                        bridgeStatus: devinBridge.statusMessage,
+                        onConnect: { showingDevinAuthInfo = true },
+                        onToggleEnabled: { enabled in
+                            serverManager.setProviderEnabled("devin", enabled: enabled)
+                            if enabled {
+                                devinBridge.start()
+                            }
+                        }
+                    )
                 }
                 
                 if !serverManager.customProviders.isEmpty {
@@ -871,6 +966,59 @@ struct SettingsView: View {
             .padding(24)
             .frame(width: 400)
         }
+        .sheet(isPresented: $showingDevinAuthInfo) {
+            VStack(spacing: 16) {
+                Text("Devin Setup")
+                    .font(.headline)
+
+                if DevinBridgeManager.hasCredentials() {
+                    Text("Credentials found! The Devin bridge will start automatically when you enable the provider.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .multilineTextAlignment(.center)
+
+                    if devinBridge.isRunning {
+                        Label("Bridge is running on port 8419", systemImage: "checkmark.circle.fill")
+                            .foregroundColor(.green)
+                            .font(.caption)
+                    } else {
+                        Button("Start Bridge") {
+                            devinBridge.start()
+                        }
+                        .controlSize(.regular)
+                    }
+                } else {
+                    Text("To use Devin, you need to authenticate first:")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("1. Install Devin CLI: `brew install --cask devin-cli`")
+                            .font(.caption)
+                        Text("2. Run: `devin auth`")
+                            .font(.caption)
+                        Text("   Or set DEVIN_OUTPOSTS_TOKEN env var")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                        Text("3. Restart VibeProxy")
+                            .font(.caption)
+                    }
+                    .padding(.leading, 8)
+
+                    Button("Open Devin API Settings") {
+                        DevinBridgeManager.openAuthPage()
+                    }
+                    .controlSize(.regular)
+                }
+
+                Button("Close") {
+                    showingDevinAuthInfo = false
+                }
+                .keyboardShortcut(.defaultAction)
+            }
+            .padding(24)
+            .frame(width: 420)
+        }
         .sheet(item: $selectedCustomProvider, onDismiss: {
             customProviderApiKey = ""
         }) { provider in
@@ -971,6 +1119,9 @@ struct SettingsView: View {
         case .promptForZAIAPIKey:
             authenticatingService = nil
             return // handled separately with API key prompt
+        case .promptForDevinAuth:
+            authenticatingService = nil
+            return // handled separately with auth info sheet
         }
         
         serverManager.runAuthCommand(command) { success, output in
@@ -1014,6 +1165,8 @@ struct SettingsView: View {
             return "🌐 Browser opened for Antigravity authentication.\n\nPlease complete the login in your browser."
         case .zai:
             return "✓ Z.AI API key added successfully.\n\nYou can now use GLM models through the proxy."
+        case .devin:
+            return "Devin bridge is ready.\n\nYou can now use Devin models through the proxy."
         }
     }
     

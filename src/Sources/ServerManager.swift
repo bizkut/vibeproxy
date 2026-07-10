@@ -868,7 +868,13 @@ class ServerManager: ObservableObject {
                 baseConfigRoot: baseConfig.root,
                 enabledProviderStates: enabledProviderStates
             ),
-            managedZAIProviderName: ProviderCatalog.managedZAIProviderName
+            managedZAIProviderName: ProviderCatalog.managedZAIProviderName,
+            includeManagedDevinProvider: isProviderEnabled(
+                ProviderCatalog.managedDevinProviderName,
+                baseConfigRoot: baseConfig.root,
+                enabledProviderStates: enabledProviderStates
+            ),
+            managedDevinProviderName: ProviderCatalog.managedDevinProviderName
         )
         
         let mergedConfigPath = authDir.appendingPathComponent(CustomProviderConstants.mergedConfigFilename)

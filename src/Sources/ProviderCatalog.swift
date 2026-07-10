@@ -2,6 +2,7 @@ import Foundation
 
 enum ProviderCatalog {
     static let managedZAIProviderName = "zai"
+    static let managedDevinProviderName = "devin"
 
     /// OAuth provider keys used in config.yaml oauth-excluded-models.
     static let oauthProviderKeys: [String: String] = [
@@ -17,4 +18,5 @@ enum ProviderCatalog {
     static let reservedCustomProviderKeys = Set(oauthProviderKeys.keys)
         .union(oauthProviderKeys.values)
         .union([managedZAIProviderName])
+        .union([managedDevinProviderName])
 }
